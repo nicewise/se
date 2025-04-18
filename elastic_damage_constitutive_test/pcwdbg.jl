@@ -2,6 +2,7 @@ using FEM, DelimitedFiles
 using Debugger
 using LinearAlgebra
 using StaticArrays
+using Plots
 
 struct MicroCrack
     direction::SVector{3}
@@ -52,7 +53,7 @@ struct AEDPCW{T<:Dim3} <: AbstractConstitutiveLaw{T}
     n::Int # 代表性裂隙族数量，ie. 球面积分高斯点数目
     cracks::Vector{MicroCrack}
     C0::SMatrix{6, 6, Float64}
-    Tr::Dict # FIXME
+    Tr_gen::Function
     Pd::SMatrix{6, 6, Float64}
     isopen::Function
     Rd::AbstractRd
@@ -70,15 +71,12 @@ struct AEDPCW{T<:Dim3} <: AbstractConstitutiveLaw{T}
         k3 = E / (1 - 2ν)
         μ2 = E / (1 + ν)
         C0 = k3 * Mandel.J + μ2 * Mandel.K
-        Tr = Dict(
-            true => c -> C0 * (cn * c.E2 + ct * c.E4) * C0 * c.ω,
-            false => c -> C0 * ct * c.E4 * C0 * c.ω
-        ) # c -- > crack 
+        Tr_gen(crack::MicroCrack, key::Bool) = C0 * Sn(crack, key, cn, ct) * C0 * crack.ω
         αk = 1 / (k3 + 2μ2)
         αμ = (2k3 + 6μ2) / 5(k3 + 2μ2) / μ2
         Pd = αk * Mandel.J + αμ * Mandel.K
         isopen = σ -> [σ' * crack.N for crack in cracks] .>= 0 # σ -> vector{Bool}
-        return new{T}(l, x, y, n, cracks, C0, Tr, Pd, isopen, Rd, tol)
+        return new{T}(l, x, y, n, cracks, C0, Tr_gen, Pd, isopen, Rd, tol)
     end
 end
 
@@ -117,31 +115,16 @@ function FEM.constitutive_law_apply!(F::AEDPCW{T}, p::AbstractPoint{<:AbstractCe
     if isnothing(before_gradient) || before_gradient
         d_old = p.statev[F.x]
         ε = p.ε + p.dε
-        stats = F.isopen(p.D * ε) # Vector{Bool} indicate is microcrack open or not
-        Tr = [F.Tr[stats[i]](F.cracks[i]) for i in 1:F.n] # FIXME
         d(x) = d_old + x # vector -> vector
+        stats = F.isopen(p.D * ε) # Vector{Bool} indicate is microcrack open or not
+        Tr = [F.Tr_gen(crack, stats[i]) for (i, crack) in enumerate(F.cracks)]
         Cd(x) = sum(d(x) .* Tr) # vector -> matrix
         B(x) = (Mandel.I + F.Pd * Cd(x)) \ F.Pd # vector -> matrix
-        #∂Chom(x) = begin # vector -> vecctor{matrix}
-        #    cd = Cd(x)
-        #    b = B(x)
-        #    return 2Tr .* b * cd - cd * b .* Tr .* b * cd
-        #end
-        #Fd(x) = - ε' .* ∂Chom(x) .* ε / 2 # vector -> vector
-
-        Fd(x) = begin
-            cd = Cd(x)
-            b = B(x)
-            CdB(x) = 2 * B(x) * Cd(x) - Mandel.I
-            o = zeros(F.n)
-            Threads.@threads for i in eachindex(Tr)
-                o[i] = -ε'*Tr[i]*CdB(x)*ε/2
-            end
-            o
-        end
-
-        g(x) = Fd(x) - Rd(F.Rd, d(x)) # vector -> vector
-        if sum( g(zeros(F.n)) .> F.tol ) >= 1
+        CdB(x) = 2 * B(x) * Cd(x) - Mandel.I # vector -> matrix
+        Fd(x) = [-ε'*Tr[i]*CdB(x)*ε/2 for i in 1:F.n]
+        #g(x) = Fd(x) - Rd(F.Rd, d(x)) # vector -> vector
+        g(x) = Rd(F.Rd, d(x)) - Fd(x)# vector -> vector
+        if sum( g(zeros(F.n)) .< -F.tol ) >= 1
             Δd = NCP_desent(g, F.n)#optim(g) # TODO
             d_old = d(Δd)
         end
@@ -152,7 +135,7 @@ function FEM.constitutive_law_apply!(F::AEDPCW{T}, p::AbstractPoint{<:AbstractCe
         d = p.statev[F.x]
         ε = p.ε + p.dε
         stats = F.isopen(p.D * ε) # Vector{Bool} indicate is microcrack open or not
-        Tr = [F.Tr[stats[i]](F.cracks[i]) for i in 1:F.n] # FIXMTE
+        Tr = [F.Tr_gen(crack, stats[i]) for (i, crack) in enumerate(F.cracks)]
         cd = sum(d .* Tr)
         b = (Mandel.I + F.Pd * cd) \ F.Pd
         Chom = F.C0 - cd + cd * b * cd
@@ -162,15 +145,14 @@ function FEM.constitutive_law_apply!(F::AEDPCW{T}, p::AbstractPoint{<:AbstractCe
     return nothing
 end
 
-
 function build_con(nincr)
-    E, ν, rc, dc = [7e4, 0.2, 9.26e-3, 7.0]
+    E, ν, c0, c1 = [3.8e4, 0.19, 7.4e-4, 4e-3]
     max_load = 2e-2
     ng = 33
     load_per_incr = max_load / nincr
     p = simple_point_gen(nstatev = ng)
     constitutive_law_apply!(constitutive_linear_elastic{Dim3}(E, ν), p)
-    cl = AEDPCW{Dim3}(E, ν, Rd_gen(1, rc, dc), n = ng)
+    cl = AEDPCW{Dim3}(E, ν, Rd_gen(4, c0, c1), n = ng)
     rcd = testcon()
     tc = simple_analysis([], [1], [load_per_incr], 6, tolerance=1e-5)
     return rcd, tc, p, cl
@@ -179,5 +161,11 @@ end
 function analysis(nincr)
     rcd, tc, p, cl = build_con(nincr)
     testcon!(rcd, tc, p, cl, nincr)
-    rcd
+    σ1 = vcat(0, [σ[1] for σ in rcd.σ])
+    ε1 = vcat(0, [ε[1] for ε in rcd.ε])
+    ε2 = vcat(0, [ε[2] for ε in rcd.ε])
+    d = vcat(0, [v[1] for v in rcd.statev])
+    plot(ε1, σ1)
+    plot!(ε2, σ1)
+    #plot(ε1, d)
 end

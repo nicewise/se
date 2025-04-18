@@ -79,7 +79,7 @@ struct AEDPCW{T<:Dim3} <: AbstractConstitutiveLaw{T}
     n::Int # 代表性裂隙族数量，ie. 球面积分高斯点数目
     cracks::Vector{MicroCrack}
     C0::SMatrix{6, 6, Float64}
-    Tr::Dict # FIXME
+    Tr_gen::Function
     Pd::SMatrix{6, 6, Float64}
     isopen::Function
     Rd::AbstractRd
@@ -97,15 +97,12 @@ struct AEDPCW{T<:Dim3} <: AbstractConstitutiveLaw{T}
         k3 = E / (1 - 2ν)
         μ2 = E / (1 + ν)
         C0 = k3 * Mandel.J + μ2 * Mandel.K
-        Tr = Dict(
-            true => c -> C0 * (cn * c.E2 + ct * c.E4) * C0 * c.ω,
-            false => c -> C0 * ct * c.E4 * C0 * c.ω
-        ) # c -- > crack 
+        Tr_gen(crack::MicroCrack, key::Bool) = C0 * Sn(crack, key, cn, ct) * C0 * crack.ω
         αk = 1 / (k3 + 2μ2)
         αμ = (2k3 + 6μ2) / 5(k3 + 2μ2) / μ2
         Pd = αk * Mandel.J + αμ * Mandel.K
         isopen = σ -> [σ' * crack.N for crack in cracks] .>= 0 # σ -> vector{Bool}
-        return new{T}(l, x, y, n, cracks, C0, Tr, Pd, isopen, Rd, tol)
+        return new{T}(l, x, y, n, cracks, C0, Tr_gen, Pd, isopen, Rd, tol)
     end
 end
 
@@ -146,31 +143,16 @@ function FEM.constitutive_law_apply!(F::AEDPCW{T}, p::AbstractPoint{<:AbstractCe
     if isnothing(before_gradient) || before_gradient
         d_old = p.statev[F.x]
         ε = p.ε + p.dε
-        stats = F.isopen(p.D * ε) # Vector{Bool} indicate is microcrack open or not
-        Tr = [F.Tr[stats[i]](F.cracks[i]) for i in 1:F.n] # FIXME
         d(x) = d_old + x # vector -> vector
+        stats = F.isopen(p.D * ε) # Vector{Bool} indicate is microcrack open or not
+        Tr = [F.Tr_gen(crack, stats[i]) for (i, crack) in enumerate(F.cracks)]
         Cd(x) = sum(d(x) .* Tr) # vector -> matrix
         B(x) = (Mandel.I + F.Pd * Cd(x)) \ F.Pd # vector -> matrix
-        #∂Chom(x) = begin # vector -> vecctor{matrix}
-        #    cd = Cd(x)
-        #    b = B(x)
-        #    return 2Tr .* b * cd - cd * b .* Tr .* b * cd
-        #end
-        #Fd(x) = - ε' .* ∂Chom(x) .* ε / 2 # vector -> vector
-
-        Fd(x) = begin
-            cd = Cd(x)
-            b = B(x)
-            CdB(x) = 2 * B(x) * Cd(x) - Mandel.I
-            o = zeros(F.n)
-            Threads.@threads for i in eachindex(Tr)
-                o[i] = -ε'*Tr[i]*CdB(x)*ε/2
-            end
-            o
-        end
-
-        g(x) = Fd(x) - Rd(F.Rd, d(x)) # vector -> vector
-        if sum( g(zeros(F.n)) .> F.tol ) >= 1
+        CdB(x) = 2 * B(x) * Cd(x) - Mandel.I # vector -> matrix
+        Fd(x) = [-ε'*Tr[i]*CdB(x)*ε/2 for i in 1:F.n]
+        #g(x) = Fd(x) - Rd(F.Rd, d(x)) # vector -> vector
+        g(x) = Rd(F.Rd, d(x)) - Fd(x)# vector -> vector
+        if sum( g(zeros(F.n)) .< -F.tol ) >= 1
             Δd = NCP_desent(g, F.n)#optim(g) # TODO
             d_old = d(Δd)
         end
@@ -181,7 +163,7 @@ function FEM.constitutive_law_apply!(F::AEDPCW{T}, p::AbstractPoint{<:AbstractCe
         d = p.statev[F.x]
         ε = p.ε + p.dε
         stats = F.isopen(p.D * ε) # Vector{Bool} indicate is microcrack open or not
-        Tr = [F.Tr[stats[i]](F.cracks[i]) for i in 1:F.n] # FIXMTE
+        Tr = [F.Tr_gen(crack, stats[i]) for (i, crack) in enumerate(F.cracks)]
         cd = sum(d .* Tr)
         b = (Mandel.I + F.Pd * cd) \ F.Pd
         Chom = F.C0 - cd + cd * b * cd
@@ -191,43 +173,39 @@ function FEM.constitutive_law_apply!(F::AEDPCW{T}, p::AbstractPoint{<:AbstractCe
     return nothing
 end
 
-
-# ╔═╡ b9e69b5f-ae1e-42ee-9402-3c8e15dd5316
-E, ν = 7e4, 0.2
-
 # ╔═╡ 9bc569db-9b73-4d55-aedf-6c04d6f5c4b7
 function build_con(material, max_load, nincr)
-	E, ν, rc, dc = material
+	E, ν, c0, c1 = material
 	ng = 33
 	load_per_incr = max_load / nincr
 	p = simple_point_gen(nstatev = ng)
 	constitutive_law_apply!(constitutive_linear_elastic{Dim3}(E, ν), p)
-	cl = AEDPCW{Dim3}(E, ν, Rd_gen(1, rc, dc), n = ng)
+	cl = AEDPCW{Dim3}(E, ν, Rd_gen(4, c0, c1), n = ng)
 	rcd = testcon()
 	tc = simple_analysis([], [1], [load_per_incr], 6, tolerance=1e-5)
 	return rcd, tc, p, cl
 end
 
 # ╔═╡ 0efa2aee-27c6-4fb9-bf0c-f808ab3087e0
-Rd_gen(1, 9.26e-3, 7.)
+Rd_gen(4, 7.4e-4, 4e-3)
 
 # ╔═╡ 92f9d2a9-465c-49b4-915e-65ed8f177086
 @bind material PlutoUI.combine() do Child
 	md"""
 	# 材料常数
 	E = $(
-		Child(NumberField(0:1e6, default=7e4))
+		Child(NumberField(0:1e6, default=3.8e4))
 	) Mpa, 
 	ν = $(
-		Child(NumberField(0:0.01:0.5, default=0.2))
+		Child(NumberField(0:0.01:0.5, default=0.19))
 	), 
 
 	# 抗力函数
-	rc = $(
-		Child(NumberField(0:1e-5:100, default=9.26e-3))
+	c0 = $(
+		Child(NumberField(0:1e-5:100, default=7.4e-4))
 	), 
-	dc = $(
-		Child(NumberField(0:1e-5:100, default=7.))
+	c1 = $(
+		Child(NumberField(0:1e-5:100, default=4e-3))
 	)
 	"""
 end
@@ -248,14 +226,14 @@ rcd, tc, p, cl = build_con(material, max_load, nincr)
 # ╔═╡ 4a32d743-c37a-407b-8b11-23fd5de71e77
 let
 	testcon!(rcd, tc, p, cl, nincr)
-	
+
 	σ1 = vcat(0, [σ[1] for σ in rcd.σ])
 	ε1 = vcat(0, [ε[1] for ε in rcd.ε])
 	ε2 = vcat(0, [ε[2] for ε in rcd.ε])
 	d = vcat(0, [v[1] for v in rcd.statev])
 	plot(ε1, σ1)
 	plot!(ε2, σ1)
-	# plot(ε1, d)
+	plot(ε1, d)
 end
 
 # ╔═╡ 3f5a394c-4a08-47d1-9d2e-8a9ba63263a5
@@ -270,12 +248,11 @@ rcd
 # ╠═3e9a5fe8-ec9e-4695-a51d-decbe1d13ed1
 # ╠═1f80e444-54b5-4904-aba0-2bf7117f7193
 # ╠═b2fc2e95-9b0e-4c9a-9241-5bcf83bf69f4
-# ╠═b9e69b5f-ae1e-42ee-9402-3c8e15dd5316
 # ╠═9bc569db-9b73-4d55-aedf-6c04d6f5c4b7
 # ╠═fb412e76-34a5-4388-821a-80af1f89c2e5
 # ╠═0efa2aee-27c6-4fb9-bf0c-f808ab3087e0
-# ╠═92f9d2a9-465c-49b4-915e-65ed8f177086
-# ╠═08997cb0-0ed4-4f84-89f3-72bc396ee210
-# ╠═e38f14ed-153a-4543-839b-8ae84c9f8739
+# ╟─92f9d2a9-465c-49b4-915e-65ed8f177086
+# ╟─08997cb0-0ed4-4f84-89f3-72bc396ee210
+# ╟─e38f14ed-153a-4543-839b-8ae84c9f8739
 # ╠═4a32d743-c37a-407b-8b11-23fd5de71e77
 # ╠═3f5a394c-4a08-47d1-9d2e-8a9ba63263a5
