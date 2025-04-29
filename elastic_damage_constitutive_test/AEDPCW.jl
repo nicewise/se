@@ -1,5 +1,5 @@
 ### A Pluto.jl notebook ###
-# v0.20.4
+# v0.20.6
 
 using Markdown
 using InteractiveUtils
@@ -7,7 +7,7 @@ using InteractiveUtils
 # This Pluto notebook uses @bind for interactivity. When running this notebook outside of Pluto, the following 'mock version' of @bind gives bound variables a default value (instead of an error).
 macro bind(def, element)
     #! format: off
-    quote
+    return quote
         local iv = try Base.loaded_modules[Base.PkgId(Base.UUID("6e696c72-6542-2067-7265-42206c756150"), "AbstractPlutoDingetjes")].Bonds.initial_value catch; b -> missing; end
         local el = $(esc(element))
         global $(esc(def)) = Core.applicable(Base.get, el) ? Base.get(el) : iv(el)
@@ -77,6 +77,7 @@ struct AEDPCW{T<:Dim3} <: AbstractConstitutiveLaw{T}
     x::Vector{Int}
     y::Vector{Int}
     n::Int # 代表性裂隙族数量，ie. 球面积分高斯点数目
+    ω::Vector{Float64}
     cracks::Vector{MicroCrack}
     C0::SMatrix{6, 6, Float64}
     Tr_gen::Function
@@ -102,7 +103,7 @@ struct AEDPCW{T<:Dim3} <: AbstractConstitutiveLaw{T}
         αμ = (2k3 + 6μ2) / 5(k3 + 2μ2) / μ2
         Pd = αk * Mandel.J + αμ * Mandel.K
         isopen = σ -> [σ' * crack.N for crack in cracks] .>= 0 # σ -> vector{Bool}
-        return new{T}(l, x, y, n, cracks, C0, Tr_gen, Pd, isopen, Rd, tol)
+        return new{T}(l, x, y, n, dnw[:, 4], cracks, C0, Tr_gen, Pd, isopen, Rd, tol)
     end
 end
 
@@ -151,7 +152,7 @@ function FEM.constitutive_law_apply!(F::AEDPCW{T}, p::AbstractPoint{<:AbstractCe
         CdB(x) = 2 * B(x) * Cd(x) - Mandel.I # vector -> matrix
         Fd(x) = [-ε'*Tr[i]*CdB(x)*ε/2 for i in 1:F.n]
         #g(x) = Fd(x) - Rd(F.Rd, d(x)) # vector -> vector
-        g(x) = Rd(F.Rd, d(x)) - Fd(x)# vector -> vector
+        g(x) = Rd(F.Rd, d(x), F.ω) - Fd(x)# vector -> vector
         if sum( g(zeros(F.n)) .< -F.tol ) >= 1
             Δd = NCP_desent(g, F.n)#optim(g) # TODO
             d_old = d(Δd)
@@ -233,7 +234,7 @@ let
 	d = vcat(0, [v[1] for v in rcd.statev])
 	plot(ε1, σ1)
 	plot!(ε2, σ1)
-	plot(ε1, d)
+	#plot(ε1, d)
 end
 
 # ╔═╡ 3f5a394c-4a08-47d1-9d2e-8a9ba63263a5
